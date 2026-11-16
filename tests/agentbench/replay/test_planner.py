@@ -253,18 +253,43 @@ def test_plan_is_stable_isolated_and_endpoint_independent(
     assert {task.source_session_id for task in chat.tasks[2:4]} == {"s1", "s2"}
 
 
-def test_plan_preserves_source_request_purpose_for_profile_role(tmp_path: Path) -> None:
+def test_plan_preserves_explicit_source_identity(tmp_path: Path) -> None:
     source = tmp_path / "requests.jsonl"
     row = _row("request", "session", "engineer", 0, 1)
-    row["request_purpose"] = "engineer"
+    row.update(
+        {
+            "request_purpose": "engineer",
+            "program_id": "source-task:engineer",
+            "task_id": "source-task",
+            "agent_id": "engineer",
+            "parent_program_id": "source-task:planner",
+            "blocks_parent": False,
+            "expected_resume": True,
+            "agent_role": "lead",
+            "spawn_reason": "engineer",
+            "workflow_profile_id": "swebench-real",
+            "profile_version": "v2",
+        }
+    )
     source.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
     plan = build_replay_plan(
         _config(source, tmp_path / "result"),
         analyze_replay_trace(source),
     )
+    request = plan.tasks[0].requests[0]
 
-    assert plan.tasks[0].requests[0].source_request_purpose == "engineer"
+    assert request.source_request_purpose == "engineer"
+    assert request.source_program_id == "source-task:engineer"
+    assert request.source_task_id == "source-task"
+    assert request.source_agent_id == "engineer"
+    assert request.source_parent_program_id == "source-task:planner"
+    assert request.source_blocks_parent is False
+    assert request.source_expected_resume is True
+    assert request.source_agent_role == "lead"
+    assert request.source_spawn_reason == "engineer"
+    assert request.source_workflow_profile_id == "swebench-real"
+    assert request.source_profile_version == "v2"
 
 
 def test_plan_materializes_retry_targets_and_prunes_terminal_timing_nodes(

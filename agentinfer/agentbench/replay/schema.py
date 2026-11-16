@@ -116,6 +116,16 @@ class ReplayRequest:
     source_evidence: ReplaySourceEvidence | None = None
     source_details: AgentXSourceDetails | None = None
     source_request_purpose: str | None = None
+    source_program_id: str | None = None
+    source_task_id: str | None = None
+    source_agent_id: str | None = None
+    source_parent_program_id: str | None = None
+    source_blocks_parent: bool | None = None
+    source_expected_resume: bool | None = None
+    source_agent_role: str | None = None
+    source_spawn_reason: str | None = None
+    source_workflow_profile_id: str | None = None
+    source_profile_version: str | None = None
 
     def __post_init__(self) -> None:
         if self.source_details is not None and not isinstance(self.source_details, AgentXSourceDetails):

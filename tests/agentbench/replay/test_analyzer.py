@@ -198,6 +198,60 @@ def test_parallel_subagents_and_blocking_return_are_inferred(
     assert requests["lead-2"].dependency_kind == "blocking_subagent_to_parent"
 
 
+def test_explicit_request_identity_is_preserved_and_drives_parent_relationship(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "requests.jsonl"
+    planner = _row("planner", actor_id="planner", actor_role="lead", started=0, finished=1)
+    planner.update(
+        {
+            "program_id": "task-1:planner",
+            "task_id": "task-1",
+            "agent_id": "planner",
+            "blocks_parent": False,
+            "expected_resume": True,
+            "agent_role": "lead",
+            "spawn_reason": "planner",
+            "workflow_profile_id": "swebench-real",
+            "profile_version": "v2",
+        }
+    )
+    explorer = _row(
+        "explorer",
+        actor_id="explorer_1",
+        actor_role="subagent",
+        started=2,
+        finished=3,
+    )
+    explorer.update(
+        {
+            "program_id": "task-1:explorer_1",
+            "task_id": "task-1",
+            "agent_id": "explorer_1",
+            "parent_program_id": "task-1:planner",
+            "blocks_parent": True,
+            "expected_resume": False,
+            "agent_role": "subagent",
+            "spawn_reason": "explorer",
+            "workflow_profile_id": "swebench-real",
+            "profile_version": "v2",
+        }
+    )
+    _write(source, [planner, explorer])
+
+    requests = {request.source_request_id: request for request in analyze_replay_trace(source).sessions[0].requests}
+    child = requests["explorer"]
+
+    assert child.parent_actor_id == "planner"
+    assert child.source_program_id == "task-1:explorer_1"
+    assert child.source_parent_program_id == "task-1:planner"
+    assert child.source_blocks_parent is True
+    assert child.source_expected_resume is False
+    assert child.source_spawn_reason == "explorer"
+    assert child.source_workflow_profile_id == "swebench-real"
+    assert child.source_profile_version == "v2"
+
+
 def test_parallel_lead_title_and_main_requests_use_separate_prompt_kinds(
     tmp_path: Path,
 ) -> None:

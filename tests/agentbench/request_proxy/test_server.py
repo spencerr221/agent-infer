@@ -16,6 +16,7 @@ from agentinfer.agentbench.request_proxy.server import (
     RequestProxyLaunchConfig,
     RequestProxyServer,
     _request_fact_identity,
+    _request_fact_metadata,
     _serve_request_proxy,
 )
 from agentinfer.scheduling.headers import CLAUDE_AGENT_HEADER, CLAUDE_SESSION_HEADER
@@ -242,6 +243,14 @@ def test_openai_endpoint_forwards_original_body_and_records_root_identity(tmp_pa
         row = json.loads((tmp_path / "requests.jsonl").read_text())
         assert (row["session_id"], row["actor_id"], row["actor_role"]) == ("root-1", "lead", "lead")
         assert (row["input_tokens"], row["output_tokens"]) == (8, 3)
+        assert row["schema_version"] == "2"
+        assert row["program_id"] == "root-1"
+        assert row["task_id"] == "root-1"
+        assert row["agent_id"] == "lead"
+        assert row["parent_program_id"] is None
+        assert row["blocks_parent"] is False
+        assert row["expected_resume"] is True
+        assert row["agent_role"] == "lead"
 
     asyncio.run(run())
 
@@ -309,6 +318,13 @@ def test_openai_stream_records_child_identity_ttft_and_usage(tmp_path: Path):
         )
         assert (row["input_tokens"], row["output_tokens"], row["cached_tokens"]) == (7, 2, 4)
         assert row["ttft_seconds"] is not None
+        assert row["program_id"] == "child-1"
+        assert row["task_id"] == "root-1"
+        assert row["agent_id"] == "child-1"
+        assert row["parent_program_id"] == "root-1"
+        assert row["blocks_parent"] is True
+        assert row["expected_resume"] is False
+        assert row["agent_role"] == "subagent"
 
     asyncio.run(run())
 
@@ -335,6 +351,30 @@ def test_request_fact_identity_prefers_canonical_nested_identity() -> None:
         "grandchild-1",
         "subagent",
     )
+
+
+def test_request_fact_metadata_preserves_upstream_correlation_and_purpose() -> None:
+    body = _body_with_identity(
+        AgentIdentity(
+            program_id="root-1:reviewer",
+            task_id="root-1",
+            agent_id="reviewer",
+            parent_program_id="root-1:engineer",
+            blocks_parent=True,
+            agent_role="subagent",
+            spawn_reason="reviewer",
+            request_id="request-123",
+        )
+    )
+
+    metadata = _request_fact_metadata({}, body)
+
+    assert metadata.request_id == "request-123"
+    assert metadata.request_purpose == "reviewer"
+    assert metadata.canonical_identity is not None
+    assert metadata.canonical_identity.program_id == "root-1:reviewer"
+    assert metadata.canonical_identity.parent_program_id == "root-1:engineer"
+    assert metadata.canonical_identity.spawn_reason == "reviewer"
 
 
 def test_request_fact_identity_preserves_claude_header_semantics() -> None:

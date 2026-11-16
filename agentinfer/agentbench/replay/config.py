@@ -47,6 +47,7 @@ class ReplayBackendConfig(ReplayStrictModel):
     metrics_url: str | None = Field(None, json_schema_extra={"cli": {"flag": "--metrics-url"}})
     router_metrics_url: str | None = None
     tokenizer_base_url: str | None = Field(None, json_schema_extra={"cli": True})
+    prompt_tokens_details_enabled: bool = False
     model: str = Field(
         "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
         json_schema_extra={"cli": True},
@@ -144,6 +145,7 @@ class ReplayConfig(ReplayStrictModel):
     workflow_profile_id: str | None = None
     profile_version: str | None = None
     profile_role_source: Literal["none", "request_purpose", "actor_id", "agent_role"] = "none"
+    infer_expected_resume_from_trace: bool = False
     request_timeout_seconds: int = Field(3600, ge=1, json_schema_extra={"cli": True})
 
     @property

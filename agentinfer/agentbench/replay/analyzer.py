@@ -41,6 +41,15 @@ class _SourceRow:
     source_line: int
     request_id: str | None
     task_id: str | None
+    program_id: str | None
+    agent_id: str | None
+    parent_program_id: str | None
+    blocks_parent: bool | None
+    expected_resume: bool | None
+    canonical_agent_role: str | None
+    spawn_reason: str | None
+    workflow_profile_id: str | None
+    profile_version: str | None
     session_id: str
     actor_id: str
     actor_role: Literal["lead", "subagent", "unknown"]
@@ -83,6 +92,10 @@ def _nonempty_string(value: object) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _optional_bool(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
 
 
 def _source_key(
@@ -194,6 +207,15 @@ def _read_source_rows(
                     source_line=source_line,
                     request_id=request_id,
                     task_id=task_id,
+                    program_id=_nonempty_string(row.get("program_id")),
+                    agent_id=_nonempty_string(row.get("agent_id")),
+                    parent_program_id=_nonempty_string(row.get("parent_program_id")),
+                    blocks_parent=_optional_bool(row.get("blocks_parent")),
+                    expected_resume=_optional_bool(row.get("expected_resume")),
+                    canonical_agent_role=_nonempty_string(row.get("agent_role")),
+                    spawn_reason=_nonempty_string(row.get("spawn_reason")),
+                    workflow_profile_id=_nonempty_string(row.get("workflow_profile_id")),
+                    profile_version=_nonempty_string(row.get("profile_version")),
                     session_id=session_id,
                     actor_id=actor_id,
                     actor_role=actor_role,
@@ -428,6 +450,11 @@ def _build_session(
     origin = rows[0].started_at
     lead_actor_id = next((row.actor_id for row in rows if row.actor_role == "lead"), "lead")
     parents: dict[str, str] = {}
+    program_actors = {
+        row.program_id: row.agent_id or row.actor_id
+        for row in rows
+        if row.program_id is not None
+    }
     requests: list[ReplayRequest] = []
     pending_by_finish: list[tuple[datetime, str, _SourceRow]] = []
     predecessor: _SourceRow | None = None
@@ -457,11 +484,13 @@ def _build_session(
         same_actor_attempt = latest_attempt_by_actor.get(row.actor_id)
 
         if row.actor_role != "lead" and row.actor_id not in parents:
-            parent = (
-                predecessor.actor_id
-                if predecessor is not None and predecessor.actor_id != row.actor_id
-                else lead_actor_id
-            )
+            parent = program_actors.get(row.parent_program_id)
+            if parent is None:
+                parent = (
+                    predecessor.actor_id
+                    if predecessor is not None and predecessor.actor_id != row.actor_id
+                    else lead_actor_id
+                )
             parents[row.actor_id] = parent
 
         token_pair = resolved_tokens.get(row.key)
@@ -512,6 +541,16 @@ def _build_session(
                 ),
                 parallel_with=parallel_keys[row.key],
                 source_request_purpose=row.request_purpose,
+                source_program_id=row.program_id,
+                source_task_id=row.task_id,
+                source_agent_id=row.agent_id,
+                source_parent_program_id=row.parent_program_id,
+                source_blocks_parent=row.blocks_parent,
+                source_expected_resume=row.expected_resume,
+                source_agent_role=row.canonical_agent_role,
+                source_spawn_reason=row.spawn_reason,
+                source_workflow_profile_id=row.workflow_profile_id,
+                source_profile_version=row.profile_version,
             )
         )
         heapq.heappush(pending_by_finish, (row.finished_at, row.key, row))

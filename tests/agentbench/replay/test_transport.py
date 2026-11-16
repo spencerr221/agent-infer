@@ -42,6 +42,7 @@ def test_chat_transport_streams_content_usage_and_plan_identity(tmp_path: Path) 
                 "backend": {
                     "base_url": "http://backend",
                     "endpoint": "/v1/chat/completions",
+                    "prompt_tokens_details_enabled": True,
                     "chat_template_kwargs": {"enable_thinking": False, "clear_thinking": True},
                 },
                 "replay": {
@@ -106,6 +107,137 @@ def test_chat_transport_streams_content_usage_and_plan_identity(tmp_path: Path) 
     assert facts[0].request_purpose == "engineer"
     assert facts[0].input_tokens == 12
     assert facts[0].output_tokens == 3
+    assert facts[0].cached_tokens == 0
+    assert facts[0].schema_version == "2"
+    assert facts[0].program_id == "session:lead"
+    assert facts[0].agent_id == "lead"
+    assert facts[0].expected_resume is True
+    assert facts[0].spawn_reason == "engineer"
+    assert facts[0].workflow_profile_id == "coding_assistant"
+
+
+def test_trace_can_mark_final_actor_request_terminal(tmp_path: Path) -> None:
+    config = ReplayBenchConfig.model_validate(
+        {
+            "experiment": {"task_num": 1},
+            "backend": {
+                "base_url": "http://backend",
+                "endpoint": "/v1/chat/completions",
+            },
+            "replay": {
+                "trace_path": "source.jsonl",
+                "infer_expected_resume_from_trace": True,
+            },
+        }
+    )
+    transport = ReplayTransport(
+        config,
+        "run",
+        RequestTraceWriter(tmp_path / "requests.jsonl"),
+    )
+
+    def node(request_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            runtime_request_id=request_id,
+            actor_id="lead",
+            actor_role="lead",
+            prompt_kind="lead_main",
+            source_request_purpose="planner",
+            parent_actor_id=None,
+            planned_output_tokens=3,
+            planned_input_tokens=12,
+            backend_sampling_seed=7,
+            node_type="request",
+        )
+
+    first = node("first")
+    final = node("final")
+    task = SimpleNamespace(
+        runtime_session_id="session",
+        requests=(first, final),
+    )
+    prompt = SyntheticPrompt(
+        "system",
+        (),
+        ({"role": "user", "content": "message"},),
+    )
+
+    first_body = transport._body(task, first, prompt)
+    final_body = transport._body(task, final, prompt)
+    first_identity = json.loads(first_body["vllm_xargs"]["agentic_context"])
+    final_identity = json.loads(final_body["vllm_xargs"]["agentic_context"])
+    asyncio.run(transport.close())
+
+    assert first_identity["expected_resume"] is True
+    assert final_identity["expected_resume"] is False
+
+
+def test_explicit_trace_identity_overrides_replay_inference(tmp_path: Path) -> None:
+    config = ReplayBenchConfig.model_validate(
+        {
+            "experiment": {"task_num": 1},
+            "backend": {
+                "base_url": "http://backend",
+                "endpoint": "/v1/chat/completions",
+            },
+            "replay": {
+                "trace_path": "source.jsonl",
+                "workflow_profile_id": "configured-profile",
+                "profile_version": "configured-version",
+                "profile_role_source": "request_purpose",
+                "infer_expected_resume_from_trace": True,
+            },
+        }
+    )
+    transport = ReplayTransport(
+        config,
+        "run",
+        RequestTraceWriter(tmp_path / "requests.jsonl"),
+    )
+    node = SimpleNamespace(
+        runtime_request_id="request",
+        actor_id="legacy-actor",
+        actor_role="subagent",
+        prompt_kind="continuation",
+        source_request_purpose="legacy-purpose",
+        parent_actor_id="legacy-parent",
+        planned_output_tokens=3,
+        planned_input_tokens=12,
+        backend_sampling_seed=7,
+        node_type="request",
+        source_program_id="source-task:explorer_1",
+        source_agent_id="explorer_1",
+        source_parent_program_id="source-task:planner",
+        source_blocks_parent=True,
+        source_expected_resume=False,
+        source_agent_role="subagent",
+        source_spawn_reason="explorer",
+        source_workflow_profile_id="source-profile",
+        source_profile_version="source-version",
+    )
+    task = SimpleNamespace(runtime_session_id="runtime-session", requests=(node,))
+    body = transport._body(
+        task,
+        node,
+        SyntheticPrompt("system", (), ({"role": "user", "content": "message"},)),
+    )
+    identity = json.loads(body["vllm_xargs"]["agentic_context"])
+    asyncio.run(transport.close())
+
+    assert identity == {
+        "program_id": "runtime-session:source-task:explorer_1",
+        "task_id": "runtime-session",
+        "session_id": "runtime-session",
+        "agent_id": "explorer_1",
+        "parent_program_id": "runtime-session:source-task:planner",
+        "blocks_parent": True,
+        "expected_resume": False,
+        "agent_role": "subagent",
+        "spawn_reason": "explorer",
+        "workflow_profile_id": "source-profile",
+        "profile_version": "source-version",
+        "request_id": "request",
+    }
 
 
 def test_messages_transport_keeps_title_prompt_tool_free_and_bridges_sampling(tmp_path: Path) -> None:
@@ -315,3 +447,52 @@ def test_token_continuations_require_actual_output_ids(tmp_path: Path, trace_typ
         assert result.assistant_token_ids == (90, 91)
     else:
         assert "output token_ids missing or incomplete" in result.error
+
+
+def test_agentx_ignores_malformed_content_chunk_but_requires_valid_usage(tmp_path: Path) -> None:
+    async def send():
+        config = ReplayBenchConfig.model_validate(
+            {
+                "experiment": {"task_num": 1},
+                "backend": {"base_url": "http://backend", "endpoint": "/v1/completions"},
+                "replay": {"trace_type": "agentX"},
+            }
+        )
+        writer = RequestTraceWriter(tmp_path / "requests.jsonl")
+        await writer.start()
+        transport = ReplayTransport(config, "run", writer)
+        await transport.client.aclose()
+
+        def respond(_request: httpx.Request) -> httpx.Response:
+            stream = (
+                'data: {"choices":[{"text":"unterminated}]}\n\n'
+                'data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":2}}\n\n'
+                "data: [DONE]\n\n"
+            )
+            return httpx.Response(200, text=stream)
+
+        transport.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        node = SimpleNamespace(
+            runtime_request_id="request",
+            actor_id="lead",
+            actor_role="lead",
+            prompt_kind="lead_main",
+            parent_actor_id=None,
+            planned_input_tokens=12,
+            planned_output_tokens=2,
+            backend_sampling_seed=7,
+        )
+        try:
+            return await transport.send(
+                SimpleNamespace(runtime_session_id="session"),
+                node,
+                SyntheticPrompt("", (), (), token_ids=tuple(range(12))),
+            )
+        finally:
+            await transport.close()
+            await writer.close()
+
+    result = asyncio.run(send())
+    assert result.success is True
+    assert result.input_tokens == 12
+    assert result.output_tokens == 2
