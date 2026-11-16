@@ -46,6 +46,16 @@ class RequestFact:
     upstream: str
     error: str | None
     request_purpose: str | None = None
+    program_id: str | None = None
+    task_id: str | None = None
+    agent_id: str | None = None
+    parent_program_id: str | None = None
+    blocks_parent: bool | None = None
+    expected_resume: bool | None = None
+    agent_role: str | None = None
+    spawn_reason: str | None = None
+    workflow_profile_id: str | None = None
+    profile_version: str | None = None
 
 
 _REQUEST_FACT_ADAPTER = TypeAdapter(RequestFact)

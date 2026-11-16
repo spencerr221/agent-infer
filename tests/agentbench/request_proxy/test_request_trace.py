@@ -162,6 +162,32 @@ def test_load_request_facts_filters_session(tmp_path: Path, monkeypatch: pytest.
     assert load_request_facts(path, session_id="session") == [fact()]
 
 
+def test_load_request_facts_accepts_v1_rows_without_canonical_identity(tmp_path: Path) -> None:
+    path = tmp_path / "requests.jsonl"
+    legacy = asdict(fact())
+    for field in (
+        "program_id",
+        "task_id",
+        "agent_id",
+        "parent_program_id",
+        "blocks_parent",
+        "expected_resume",
+        "agent_role",
+        "spawn_reason",
+        "workflow_profile_id",
+        "profile_version",
+    ):
+        legacy.pop(field)
+    path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+    loaded = load_request_facts(path)
+
+    assert len(loaded) == 1
+    assert loaded[0].schema_version == "1"
+    assert loaded[0].program_id is None
+    assert loaded[0].expected_resume is None
+
+
 def test_load_request_facts_preserves_valid_prefix_before_incomplete_tail(tmp_path: Path) -> None:
     path = tmp_path / "requests.jsonl"
     path.write_text(json.dumps(asdict(fact())) + '\n{"request_id":', encoding="utf-8")

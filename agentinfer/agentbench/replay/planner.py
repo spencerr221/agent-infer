@@ -54,6 +54,16 @@ class ReplayPlanNode:
     source_prefix_tokens: int | None = None
     source_output_tokens: int | None = None
     source_request_purpose: str | None = None
+    source_program_id: str | None = None
+    source_task_id: str | None = None
+    source_agent_id: str | None = None
+    source_parent_program_id: str | None = None
+    source_blocks_parent: bool | None = None
+    source_expected_resume: bool | None = None
+    source_agent_role: str | None = None
+    source_spawn_reason: str | None = None
+    source_workflow_profile_id: str | None = None
+    source_profile_version: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize only the materialized fields required to execute the node."""
@@ -94,6 +104,21 @@ class ReplayPlanNode:
             value["source_prefix_tokens"] = self.source_prefix_tokens
         if self.source_request_purpose is not None:
             value["source_request_purpose"] = self.source_request_purpose
+        for name in (
+            "source_program_id",
+            "source_task_id",
+            "source_agent_id",
+            "source_parent_program_id",
+            "source_blocks_parent",
+            "source_expected_resume",
+            "source_agent_role",
+            "source_spawn_reason",
+            "source_workflow_profile_id",
+            "source_profile_version",
+        ):
+            field_value = getattr(self, name)
+            if field_value is not None:
+                value[name] = field_value
         return value
 
 
@@ -304,6 +329,16 @@ def _task_plan(
                     request.source_cached_tokens if config.replay.prompt_shape == "tracelab_synthetic" else None
                 ),
                 source_request_purpose=request.source_request_purpose,
+                source_program_id=request.source_program_id,
+                source_task_id=request.source_task_id,
+                source_agent_id=request.source_agent_id,
+                source_parent_program_id=request.source_parent_program_id,
+                source_blocks_parent=request.source_blocks_parent,
+                source_expected_resume=request.source_expected_resume,
+                source_agent_role=request.source_agent_role,
+                source_spawn_reason=request.source_spawn_reason,
+                source_workflow_profile_id=request.source_workflow_profile_id,
+                source_profile_version=request.source_profile_version,
             )
         )
     return ReplayTaskPlan(

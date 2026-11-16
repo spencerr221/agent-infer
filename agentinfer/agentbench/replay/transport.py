@@ -172,7 +172,16 @@ class ReplayTransport:
                             continue
                         if not raw:
                             continue
-                        payload = json.loads(raw)
+                        try:
+                            payload = json.loads(raw)
+                        except json.JSONDecodeError:
+                            # AgentX never consumes generated text or output IDs.
+                            # A malformed content-only SSE chunk is therefore
+                            # ignorable; final usage and [DONE] are still
+                            # required by the validation below.
+                            if self.config.replay.trace_type == "agentX":
+                                continue
+                            raise
                         if not isinstance(payload, dict):
                             raise ValueError("Backend stream event must be an object")
                         if payload.get("error") or payload.get("type") == "error":
@@ -243,11 +252,22 @@ class ReplayTransport:
                 )
         finished_clock = time.monotonic()
         success = status_code is not None and status_code < 400 and error is None
+        if (
+            success
+            and self.config.backend.prompt_tokens_details_enabled
+            and "input_tokens" in usage
+            and "cache_read_input_tokens" not in usage
+        ):
+            # vLLM omits prompt_tokens_details when the cached-token count is
+            # zero. Only make that omission observable as a true miss when the
+            # run explicitly declares that the server capability is enabled.
+            usage["cache_read_input_tokens"] = 0
         if self.writer is None:
             raise RuntimeError("Replay transport cannot record a measured request without a trace writer")
+        identity = self._identity(task, node)
         self.writer.submit(
             RequestFact(
-                schema_version="1",
+                schema_version="2",
                 run_id=self.run_id,
                 request_id=node.runtime_request_id,
                 session_id=task.runtime_session_id,
@@ -266,6 +286,16 @@ class ReplayTransport:
                 upstream=self.upstream,
                 error=error,
                 request_purpose=getattr(node, "source_request_purpose", None) or node.prompt_kind,
+                program_id=identity.program_id,
+                task_id=identity.task_id,
+                agent_id=identity.agent_id,
+                parent_program_id=identity.parent_program_id,
+                blocks_parent=identity.blocks_parent,
+                expected_resume=identity.expected_resume,
+                agent_role=identity.agent_role,
+                spawn_reason=identity.spawn_reason,
+                workflow_profile_id=identity.workflow_profile_id,
+                profile_version=identity.profile_version,
             )
         )
         return TransportResult(
@@ -316,19 +346,7 @@ class ReplayTransport:
         prompt: SyntheticPrompt,
     ) -> dict[str, object]:
         output_tokens = self._effective_output_tokens(node)
-        identity = AgentIdentity(
-            program_id=f"{task.runtime_session_id}:{node.actor_id}",
-            task_id=task.runtime_session_id,
-            session_id=task.runtime_session_id,
-            agent_id=node.actor_id,
-            parent_program_id=(f"{task.runtime_session_id}:{node.parent_actor_id}" if node.parent_actor_id else None),
-            blocks_parent=node.actor_role == "subagent" and self.config.replay.trace_type != "agentX",
-            agent_role=node.actor_role,
-            spawn_reason=self._profile_role(node),
-            workflow_profile_id=self.config.replay.workflow_profile_id,
-            profile_version=self.config.replay.profile_version,
-            request_id=node.runtime_request_id,
-        )
+        identity = self._identity(task, node)
         if prompt.token_ids is not None:
             if len(prompt.token_ids) != node.planned_input_tokens:
                 raise ValueError("completion requires exact planned token IDs")
@@ -380,6 +398,63 @@ class ReplayTransport:
         }
         return body
 
+    def _identity(
+        self,
+        task: ReplayTaskPlan,
+        node: ReplayPlanNode,
+    ) -> AgentIdentity:
+        source_program_id = getattr(node, "source_program_id", None)
+        source_parent_program_id = getattr(node, "source_parent_program_id", None)
+        source_blocks_parent = getattr(node, "source_blocks_parent", None)
+        source_expected_resume = getattr(node, "source_expected_resume", None)
+        return AgentIdentity(
+            program_id=self._runtime_program_id(
+                task.runtime_session_id,
+                source_program_id,
+                node.actor_id,
+            ),
+            task_id=task.runtime_session_id,
+            session_id=task.runtime_session_id,
+            agent_id=getattr(node, "source_agent_id", None) or node.actor_id,
+            parent_program_id=(
+                self._runtime_program_id(
+                    task.runtime_session_id,
+                    source_parent_program_id,
+                    node.parent_actor_id,
+                )
+                if source_parent_program_id is not None or node.parent_actor_id
+                else None
+            ),
+            blocks_parent=(
+                source_blocks_parent
+                if isinstance(source_blocks_parent, bool)
+                else node.actor_role == "subagent" and self.config.replay.trace_type != "agentX"
+            ),
+            agent_role=getattr(node, "source_agent_role", None) or node.actor_role,
+            spawn_reason=(getattr(node, "source_spawn_reason", None) or self._profile_role(node)),
+            workflow_profile_id=(
+                getattr(node, "source_workflow_profile_id", None) or self.config.replay.workflow_profile_id
+            ),
+            profile_version=(getattr(node, "source_profile_version", None) or self.config.replay.profile_version),
+            request_id=node.runtime_request_id,
+            expected_resume=(
+                source_expected_resume
+                if isinstance(source_expected_resume, bool)
+                else self._expected_resume(task, node)
+            ),
+        )
+
+    @staticmethod
+    def _runtime_program_id(
+        runtime_session_id: str,
+        source_program_id: str | None,
+        fallback_actor_id: str | None,
+    ) -> str:
+        component = source_program_id or fallback_actor_id
+        if component is None:
+            raise ValueError("Replay identity requires a Program component")
+        return f"{runtime_session_id}:{component}"
+
     def _profile_role(self, node: ReplayPlanNode) -> str | None:
         """Resolve the configured source for Router workflow-profile role matching."""
 
@@ -391,6 +466,31 @@ class ReplayTransport:
         if source == "agent_role":
             return node.actor_role
         return None
+
+    def _expected_resume(
+        self,
+        task: ReplayTaskPlan,
+        node: ReplayPlanNode,
+    ) -> bool:
+        """Infer whether this actor has a later Backend request in the trace."""
+
+        if not self.config.replay.infer_expected_resume_from_trace:
+            return True
+        requests = getattr(task, "requests", ())
+        current_index = next(
+            (
+                index
+                for index, candidate in enumerate(requests)
+                if candidate.runtime_request_id == node.runtime_request_id
+            ),
+            None,
+        )
+        if current_index is None:
+            return True
+        return any(
+            candidate.actor_id == node.actor_id and candidate.node_type == "request"
+            for candidate in requests[current_index + 1 :]
+        )
 
     def _observe(
         self,

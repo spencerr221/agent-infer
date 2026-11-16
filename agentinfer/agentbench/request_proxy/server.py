@@ -27,6 +27,7 @@ from agentinfer.scheduling.headers import (
     select_router_headers,
 )
 from agentinfer.scheduling.identity import (
+    AgentIdentity,
     MetadataError,
     parse_agent_identity as parse_canonical_identity,
 )
@@ -58,6 +59,14 @@ _HOP_BY_HOP_HEADERS = frozenset(
         "upgrade",
     }
 )
+
+
+@dataclass(frozen=True)
+class _RequestFactMetadata:
+    identity: AgentRequestIdentity
+    canonical_identity: AgentIdentity | None
+    request_id: str
+    request_purpose: str | None
 
 
 @dataclass(frozen=True)
@@ -136,8 +145,7 @@ class RequestProxyServer:
         response: httpx.Response | None = None
         try:
             body = await request.body()
-            identity = _request_fact_identity(request.headers, body)
-            request_id = str(uuid.uuid4())
+            metadata = _request_fact_metadata(request.headers, body)
             started = datetime.now(timezone.utc)
             started_clock = time.monotonic()
             try:
@@ -149,12 +157,10 @@ class RequestProxyServer:
                 )
                 response = await self.client.send(upstream_request, stream=True)
             except asyncio.CancelledError:
-                self._submit_safely(identity, request_id, started, started_clock, None, None, {}, "request cancelled")
+                self._submit_safely(metadata, started, started_clock, None, None, {}, "request cancelled")
                 raise
             except Exception as exc:
-                self._submit_safely(
-                    identity, request_id, started, started_clock, None, None, {}, f"{type(exc).__name__}: {exc}"
-                )
+                self._submit_safely(metadata, started, started_clock, None, None, {}, f"{type(exc).__name__}: {exc}")
                 raise
 
             content_type = response.headers.get("content-type", "").lower()
@@ -169,8 +175,7 @@ class RequestProxyServer:
                     )
                     observed_payload = _decode_payload(payload, content_encoding)
                     self._submit_safely(
-                        identity,
-                        request_id,
+                        metadata,
                         started,
                         started_clock,
                         response.status_code,
@@ -181,8 +186,7 @@ class RequestProxyServer:
                     return Response(content=payload, status_code=response.status_code, headers=response_headers)
                 except asyncio.CancelledError:
                     self._submit_safely(
-                        identity,
-                        request_id,
+                        metadata,
                         started,
                         started_clock,
                         response.status_code,
@@ -193,8 +197,7 @@ class RequestProxyServer:
                     raise
                 except Exception as exc:
                     self._submit_safely(
-                        identity,
-                        request_id,
+                        metadata,
                         started,
                         started_clock,
                         response.status_code,
@@ -220,8 +223,7 @@ class RequestProxyServer:
                 finally:
                     try:
                         self._submit_safely(
-                            identity,
-                            request_id,
+                            metadata,
                             started,
                             started_clock,
                             response.status_code,
@@ -266,8 +268,7 @@ class RequestProxyServer:
 
     def _submit_safely(
         self,
-        identity: AgentRequestIdentity,
-        request_id: str,
+        metadata: _RequestFactMetadata,
         started: datetime,
         started_clock: float,
         status_code: int | None,
@@ -276,14 +277,13 @@ class RequestProxyServer:
         error: str | None,
     ) -> None:
         try:
-            self._submit(identity, request_id, started, started_clock, status_code, ttft, usage, error)
+            self._submit(metadata, started, started_clock, status_code, ttft, usage, error)
         except RuntimeError:
             pass
 
     def _submit(
         self,
-        identity: AgentRequestIdentity,
-        request_id: str,
+        metadata: _RequestFactMetadata,
         started: datetime,
         started_clock: float,
         status_code: int | None,
@@ -291,14 +291,15 @@ class RequestProxyServer:
         usage: Mapping[str, object],
         error: str | None,
     ) -> None:
+        canonical = metadata.canonical_identity
         self.writer.submit(
             RequestFact(
-                schema_version="1",
+                schema_version="2",
                 run_id=self.run_id,
-                request_id=request_id,
-                session_id=identity.session_id,
-                actor_id=identity.actor_id,
-                actor_role=identity.actor_role,
+                request_id=metadata.request_id,
+                session_id=metadata.identity.session_id,
+                actor_id=metadata.identity.actor_id,
+                actor_role=metadata.identity.actor_role,
                 started_at=started.isoformat(),
                 finished_at=datetime.now(timezone.utc).isoformat(),
                 status="success" if status_code is not None and status_code < 400 and error is None else "error",
@@ -311,6 +312,17 @@ class RequestProxyServer:
                 cached_tokens=_int_or_none(usage.get("cache_read_input_tokens")),
                 upstream=self.upstream_url,
                 error=error,
+                request_purpose=metadata.request_purpose,
+                program_id=canonical.program_id if canonical is not None else None,
+                task_id=canonical.task_id if canonical is not None else None,
+                agent_id=canonical.agent_id if canonical is not None else None,
+                parent_program_id=canonical.parent_program_id if canonical is not None else None,
+                blocks_parent=canonical.blocks_parent if canonical is not None else None,
+                expected_resume=canonical.expected_resume if canonical is not None else None,
+                agent_role=canonical.agent_role if canonical is not None else None,
+                spawn_reason=canonical.spawn_reason if canonical is not None else None,
+                workflow_profile_id=canonical.workflow_profile_id if canonical is not None else None,
+                profile_version=canonical.profile_version if canonical is not None else None,
             )
         )
 
@@ -452,27 +464,39 @@ def _build_usage_observers() -> dict[str, type]:
 def _request_fact_identity(headers: Mapping[str, str], body: bytes) -> AgentRequestIdentity:
     """Derive benchmark trace identity from canonical metadata without affecting forwarding."""
 
+    return _request_fact_metadata(headers, body).identity
+
+
+def _request_fact_metadata(headers: Mapping[str, str], body: bytes) -> _RequestFactMetadata:
+    """Derive trace identity plus optional upstream correlation metadata."""
+
     header_identity = parse_header_identity(headers)
+    fallback = _RequestFactMetadata(header_identity, None, str(uuid.uuid4()), None)
     try:
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return header_identity
+        return fallback
     if not isinstance(payload, dict):
-        return header_identity
+        return fallback
     try:
         identity = parse_canonical_identity(
             vllm_xargs=payload.get("vllm_xargs"),
             headers=headers,
         )
     except MetadataError:
-        return header_identity
+        return fallback
     if identity is None:
-        return header_identity
+        return fallback
     actor_role = identity.agent_role if identity.agent_role in {"lead", "subagent"} else "unknown"
-    return AgentRequestIdentity(
-        session_id=identity.task_id or identity.session_id,
-        actor_id=identity.agent_id or identity.program_id,
-        actor_role=actor_role,
+    return _RequestFactMetadata(
+        identity=AgentRequestIdentity(
+            session_id=identity.task_id or identity.session_id,
+            actor_id=identity.agent_id or identity.program_id,
+            actor_role=actor_role,
+        ),
+        canonical_identity=identity,
+        request_id=identity.request_id or fallback.request_id,
+        request_purpose=identity.spawn_reason,
     )
 
 
